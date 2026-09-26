@@ -1,0 +1,25 @@
+# Variables de entorno (credenciales de Supabase y Gemini)
+.env
+.env.*
+!.env.example
+
+# Entorno virtual
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Archivos generados
+*.xlsx
+*.pdf
+
+# Editores y sistema operativo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
