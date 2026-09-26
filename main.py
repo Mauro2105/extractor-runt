@@ -19,7 +19,7 @@ app = FastAPI(title="API Extracción RUNT")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -54,6 +54,10 @@ def verificar_usuario(credentials: HTTPAuthorizationCredentials = Depends(securi
             status_code=401,
             detail="Acceso denegado. Token inválido, falso o expirado."
         )
+
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "API Extractor RUNT activa y operando"}
 
 @app.post("/procesar-pdf/")
 def procesar_pdf(file: UploadFile = File(...), usuario = Depends(verificar_usuario)):
