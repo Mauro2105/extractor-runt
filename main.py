@@ -2,7 +2,6 @@ import io
 import json
 import os
 import time
-
 import google.generativeai as genai
 import pandas as pd
 from dotenv import load_dotenv
@@ -56,7 +55,7 @@ def verificar_usuario(credentials: HTTPAuthorizationCredentials = Depends(securi
         )
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
     return {"status": "ok", "message": "API Extractor RUNT activa y operando"}
 
