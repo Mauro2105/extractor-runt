@@ -3,6 +3,7 @@ import io
 import json
 import os
 import time
+import threading
 import google.generativeai as genai
 import pandas as pd
 from dotenv import load_dotenv
@@ -43,6 +44,7 @@ security = HTTPBearer()
 
 # Umbral de páginas: <= 15 procesa en línea (sale en el Excel de inmediato); > 15 va a segundo plano
 UMBRAL_PAGINAS_BACKGROUND = 15
+procesamiento_lock = threading.Lock()
 
 
 def verificar_usuario(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -64,137 +66,149 @@ def procesar_documento_por_lotes(pdf_bytes: bytes, filename: str) -> list[str]:
     """
     nombres_procesados = []
 
-    try:
-        print(f"[*] Iniciando procesamiento para: {filename}")
+    # El Lock garantiza que solo 1 PDF use Supabase y Gemini a la vez (cola estricta)
+    with procesamiento_lock:
+        try:
+            print(f"[*] Iniciando procesamiento para: {filename}")
 
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        total_pages = len(reader.pages)
-        chunk_size = 5
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            total_pages = len(reader.pages)
+            chunk_size = 5
 
-        prompt = """
-        Analiza este documento del RUNT que puede contener múltiples pantallazos o páginas.
-        Extrae la información de todas las personas que aparezcan y consolida todos sus registros.
-        Devuelve ÚNICAMENTE un JSON válido con esta estructura exacta, sin texto adicional:
-        {
-          "personas": [
+            prompt = """
+            Analiza este documento del RUNT que puede contener múltiples pantallazos o páginas.
+            Extrae la información de todas las personas que aparezcan y consolida todos sus registros.
+            Devuelve ÚNICAMENTE un JSON válido con esta estructura exacta, sin texto adicional:
             {
-              "datos_basicos": {
-                "tipo_documento": "string",
-                "numero_documento": "string",
-                "nombres": "string",
-                "apellidos": "string",
-                "estado_runt": "string",
-                "celular": "string",
-                "correo_electronico": "string"
-              },
-              "registros_ubicabilidad": [
+            "personas": [
                 {
-                  "direccion": "string",
-                  "municipio_departamento": "string",
-                  "telefono": "string",
-                  "tipo_direccion": "string",
-                  "estado_direccion": "string"
+                "datos_basicos": {
+                    "tipo_documento": "string",
+                    "numero_documento": "string",
+                    "nombres": "string",
+                    "apellidos": "string",
+                    "estado_runt": "string",
+                    "celular": "string",
+                    "correo_electronico": "string"
+                },
+                "registros_ubicabilidad": [
+                    {
+                    "direccion": "string",
+                    "municipio_departamento": "string",
+                    "telefono": "string",
+                    "tipo_direccion": "string",
+                    "estado_direccion": "string"
+                    }
+                ]
                 }
-              ]
+            ]
             }
-          ]
-        }
-        Si un campo está vacío o dice "SIN REGISTRO", usa el valor null de JSON (sin comillas).
-        """
+            Si un campo está vacío o dice "SIN REGISTRO", usa el valor null de JSON (sin comillas).
+            """
 
-        for i in range(0, total_pages, chunk_size):
-            rango_inicio = i + 1
-            rango_fin = min(i + chunk_size, total_pages)
-            print(f"[*] Procesando páginas {rango_inicio} a {rango_fin} de {total_pages}...")
+            # Instanciamos el modelo una sola vez forzando salida JSON válida
+            model = genai.GenerativeModel(
+                'gemini-3.5-flash-lite',
+                generation_config={"response_mime_type": "application/json"}
+            )
 
-            writer = PdfWriter()
-            for j in range(i, rango_fin):
-                writer.add_page(reader.pages[j])
+            for i in range(0, total_pages, chunk_size):
+                rango_inicio = i + 1
+                rango_fin = min(i + chunk_size, total_pages)
+                print(f"[*] Procesando páginas {rango_inicio} a {rango_fin} de {total_pages}...")
 
-            chunk_bytes_io = io.BytesIO()
-            writer.write(chunk_bytes_io)
-            chunk_bytes_io.seek(0)
+                writer = PdfWriter()
+                for j in range(i, rango_fin):
+                    writer.add_page(reader.pages[j])
 
-            pdf_part = {
-                "mime_type": "application/pdf",
-                "data": chunk_bytes_io.read()
-            }
+                chunk_bytes_io = io.BytesIO()
+                writer.write(chunk_bytes_io)
+                chunk_bytes_io.seek(0)
 
-            max_intentos = 3
-            response = None
+                pdf_part = {
+                    "mime_type": "application/pdf",
+                    "data": chunk_bytes_io.read()
+                }
 
-            for intento in range(max_intentos):
-                try:
-                    model = genai.GenerativeModel('gemini-3.5-flash-lite')
-                    response = model.generate_content([pdf_part, prompt])
-                    break
-                except Exception as e:
-                    if intento == max_intentos - 1:
-                        print(f"[-] Fallo procesando lote {rango_inicio}-{rango_fin}. Error: {e}")
-                    time.sleep(2)
+                max_intentos = 3
+                response = None
 
-            # Liberar memoria del lote actual apenas termina la llamada
-            del pdf_part, chunk_bytes_io, writer
-            gc.collect()
+                for intento in range(max_intentos):
+                    try:
+                        response = model.generate_content([pdf_part, prompt])
+                        break
+                    except Exception as e:
+                        error_str = str(e)
+                        if "429" in error_str or "Quota" in error_str:
+                            print(f"[!] Cuota 429 en páginas {rango_inicio}-{rango_fin}. Esperando 30s...")
+                            time.sleep(30)
+                        else:
+                            if intento == max_intentos - 1:
+                                print(f"[-] Fallo procesando lote {rango_inicio}-{rango_fin}. Error: {e}")
+                            time.sleep(2)
 
-            if not response:
-                continue
+                # Liberar memoria del lote actual apenas termina la llamada
+                del pdf_part, chunk_bytes_io, writer
+                gc.collect()
 
-            try:
-                texto_limpio = response.text.strip().removeprefix("```json").removesuffix("```").strip()
-                datos_json = json.loads(texto_limpio)
-            except Exception as e:
-                print(f"[-] Error parseando JSON en páginas {rango_inicio}-{rango_fin}: {e}")
-                continue
-
-            personas_extraidas = datos_json.get("personas", [])
-
-            for persona in personas_extraidas:
-                datos_basicos = persona.get("datos_basicos", {})
-                registros = persona.get("registros_ubicabilidad", [])
-
-                if not datos_basicos or not datos_basicos.get("numero_documento"):
+                if not response:
                     continue
 
-                persona_query = supabase.table("personas").select("id").eq("numero_documento", datos_basicos["numero_documento"]).execute()
-                if len(persona_query.data) > 0:
-                    persona_id = persona_query.data[0]["id"]
-                else:
-                    insert_persona = supabase.table("personas").insert(datos_basicos).execute()
-                    persona_id = insert_persona.data[0]["id"]
+                try:
+                    texto_limpio = response.text.strip().removeprefix("```json").removesuffix("```").strip()
+                    datos_json = json.loads(texto_limpio, strict=False)
+                except Exception as e:
+                    print(f"[-] Error parseando JSON en páginas {rango_inicio}-{rango_fin}: {e}")
+                    continue
 
-                query_existentes = supabase.table("registros_ubicabilidad").select("direccion, municipio_departamento, telefono").eq("persona_id", persona_id).execute()
-                direcciones_existentes = query_existentes.data
+                personas_extraidas = datos_json.get("personas", [])
 
-                for registro in registros:
-                    es_duplicado = False
-                    for ext in direcciones_existentes:
-                        if (ext.get("direccion") == registro.get("direccion") and
-                            ext.get("municipio_departamento") == registro.get("municipio_departamento") and
-                            ext.get("telefono") == registro.get("telefono")):
-                            es_duplicado = True
-                            break
+                for persona in personas_extraidas:
+                    datos_basicos = persona.get("datos_basicos", {})
+                    registros = persona.get("registros_ubicabilidad", [])
 
-                    if not es_duplicado:
-                        registro["persona_id"] = persona_id
-                        supabase.table("registros_ubicabilidad").insert(registro).execute()
-                        direcciones_existentes.append(registro)
+                    if not datos_basicos or not datos_basicos.get("numero_documento"):
+                        continue
 
-                nombre = datos_basicos.get("nombres")
-                nombre_seguro = str(nombre) if nombre is not None and str(nombre).strip() != "" else "Desconocido"
-                nombres_procesados.append(nombre_seguro)
-                print(f"[+] Registrado/Actualizado: {nombre_seguro} ({datos_basicos['numero_documento']})")
+                    persona_query = supabase.table("personas").select("id").eq("numero_documento", datos_basicos["numero_documento"]).execute()
+                    if len(persona_query.data) > 0:
+                        persona_id = persona_query.data[0]["id"]
+                    else:
+                        insert_persona = supabase.table("personas").insert(datos_basicos).execute()
+                        persona_id = insert_persona.data[0]["id"]
 
-            # Solo pausar entre lotes si aún quedan páginas pendientes
-            if rango_fin < total_pages:
-                time.sleep(4)
+                    query_existentes = supabase.table("registros_ubicabilidad").select("direccion, municipio_departamento, telefono").eq("persona_id", persona_id).execute()
+                    direcciones_existentes = query_existentes.data
 
-        print(f"[OK] Procesamiento completo para: {filename}. Total personas: {len(nombres_procesados)}")
-        return nombres_procesados
+                    for registro in registros:
+                        es_duplicado = False
+                        for ext in direcciones_existentes:
+                            if (ext.get("direccion") == registro.get("direccion") and
+                                ext.get("municipio_departamento") == registro.get("municipio_departamento") and
+                                ext.get("telefono") == registro.get("telefono")):
+                                es_duplicado = True
+                                break
 
-    except Exception as e:
-        print(f"[!] Error crítico procesando {filename}: {str(e)}")
-        raise
+                        if not es_duplicado:
+                            registro["persona_id"] = persona_id
+                            supabase.table("registros_ubicabilidad").insert(registro).execute()
+                            direcciones_existentes.append(registro)
+
+                    nombre = datos_basicos.get("nombres")
+                    nombre_seguro = str(nombre) if nombre is not None and str(nombre).strip() != "" else "Desconocido"
+                    nombres_procesados.append(nombre_seguro)
+                    print(f"[+] Registrado/Actualizado: {nombre_seguro} ({datos_basicos['numero_documento']})")
+
+                # Solo pausar entre lotes si aún quedan páginas pendientes
+                if rango_fin < total_pages:
+                    time.sleep(4)
+
+            print(f"[OK] Procesamiento completo para: {filename}. Total personas: {len(nombres_procesados)}")
+            return nombres_procesados
+
+        except Exception as e:
+            print(f"[!] Error crítico procesando {filename}: {str(e)}")
+            raise
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
